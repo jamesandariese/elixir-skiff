@@ -1,6 +1,6 @@
 # Skiff
 
-A Raft[1] implementation in Elixir.
+A [Raft][1] implementation in Elixir.
 
 ## Trying it out
 
