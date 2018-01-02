@@ -8,6 +8,10 @@ defmodule Skiff do
   defmodule State do
     defstruct currentTerm: 0, votedFor: nil, log: [%{:term => 1, :index => 2}], commitIndex: 0, lastApplied: 0, nextIndex: %{}, matchIndex: %{}
   end
+  
+  defmodule LogEntry do
+    defstruct index: 0, term: 0, value: nil
+  end
 
   def init(_args) do
     Process.register(self(), :skiff)
@@ -60,6 +64,13 @@ defmodule Skiff do
   end
 
   # find the log entry
+  # testing for this should include terminating based on sorting
+  # - have a log entry in the test at the end that is out of order and see if it finds it
+  #   tl = [%LogEntry{term: 3, index: 3, value: "a"}, %LogEntry{term: 2, index: 1, value: "b"}, %LogEntry{term: 4, index: 1, value: "failed test"}]
+  #   search for 4,1
+  #   expected result is nil because the term of the first item is too low to have a term of 4 come after
+  #   search for 2,2
+  #   expected result is nil because the terms match and the index is already too low.
   def find_log_entry([], _term, _index), do: nil
   def find_log_entry([log = %{:term => log_term, :index => log_index} | _rest], term, index) when term == log_term and index == log_index, do: log
   def find_log_entry([%{:term => log_term, :index => log_index} | _rest], term, index) when term == log_term and index > log_index, do: nil
