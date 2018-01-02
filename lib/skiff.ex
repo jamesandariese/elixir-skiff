@@ -77,14 +77,68 @@ defmodule Skiff do
   def find_log_entry([%{:term => log_term} | _rest], term, _index) when term > log_term, do: nil
   def find_log_entry([_head | rest], term, index), do: find_log_entry(rest, term, index)
 
+  # 
+  # if we're out of new logs, we're done.  tack the oldlogs onto the end.
+  def merge_logs([], oldlogs), do: oldlogs
+
+  # we've found where the logs meet.  merge them.
+  def merge_logs(
+    [newlog_head = %{:term => newlog_term, :index => newlog_index} | newlog_rest],
+    [oldlog_head = %{:term => oldlog_term, :index => oldlog_index} | oldlog_rest]
+  ) when newlog_term == oldlog_term and newlog_index == oldlog_index do
+    IO.inspect("merge logs here")
+    IO.inspect(newlog_head)
+    IO.inspect(oldlog_rest)
+    [oldlog_head | merge_logs(newlog_rest, oldlog_rest)]
+  end
+
+  # add any that are just plain new
+  def merge_logs(
+    [newlog_head = %{:term => newlog_term, :index => newlog_index} | newlog_rest],
+    [oldlog_head = %{:term => oldlog_term, :index => oldlog_index} | oldlog_rest]
+  ) when newlog_index > oldlog_index do
+    IO.inspect("add new log")
+    IO.inspect(newlog_head)
+    [newlog_head | merge_logs(newlog_rest, [oldlog_head | oldlog_rest])]
+  end
+
+  # remove any conflicts
+  def merge_logs(
+    [newlog_head = %{:term => newlog_term, :index => newlog_index} | newlog_rest],
+    [oldlog_head = %{:term => oldlog_term, :index => oldlog_index} | oldlog_rest]
+  ) when newlog_index == oldlog_index and newlog_term != oldlog_term do
+    IO.inspect("remove conflicts")
+    IO.inspect([newlog_head | newlog_rest])
+    IO.inspect([oldlog_head | oldlog_rest])
+    [newlog_head | merge_logs(newlog_rest, oldlog_rest)]
+  end
+
+  # we've run out of old logs.
+  def merge_logs(newlogs, []), do: newlogs
+
   ########################
   # AppendEntries
   @doc """
   """
   def handle_call({:appendEntries, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}, _from, state) do
     if term < state.currentTerm do
-      false
+      {:reply, false, state}
     else
+      if find_log_entry(state.log, prevLogTerm, prevLogIndex) == nil do
+        {:reply, false, state}
+      else
+        merged = merge_logs(entries, state.log)
+        commitIndex = if leaderCommit > state.commitIndex do
+          min(leaderCommit, Enum.at(merged, 0).index)
+        else
+          state.commitIndex
+        end
+        {:reply, {state.currentTerm, true}, %{state | commitIndex: commitIndex, log: merged}}
+      end
     end
+  end
+
+  def handle_call(:state, _from, state) do
+    {:reply, state, state}
   end
 end
