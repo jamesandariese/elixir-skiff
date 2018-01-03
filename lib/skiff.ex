@@ -6,7 +6,7 @@ defmodule Skiff do
   use GenServer
 
   defmodule State do
-    defstruct currentTerm: 0, votedFor: nil, log: [%{:term => 1, :index => 2}], commitIndex: 0, lastApplied: 0, nextIndex: %{}, matchIndex: %{}
+    defstruct currentTerm: 0, votedFor: nil, log: [], commitIndex: 0, lastApplied: 0, nextIndex: %{}, matchIndex: %{}
   end
   
   defmodule LogEntry do
@@ -63,6 +63,28 @@ defmodule Skiff do
     {:reply, {state.currentTerm, false}, state}
   end
 
+  ########################
+  # AppendEntries
+  @doc """
+  """
+  def handle_call({:appendEntries, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}, _from, state) do
+    if term < state.currentTerm do
+      {:reply, {state.currentTerm, false}, state}
+    else
+      if prevLogIndex != state.commitIndex and find_log_entry(state.log, prevLogTerm, prevLogIndex) == nil do
+        {:reply, {state.currentTerm, false}, state}
+      else
+        {:reply, {state.currentTerm, true}, %{state | log: merge_logs(entries, state.log)}}
+      end
+    end
+    |> update_state_with_leader_commit(leaderCommit)
+  end
+
+  def handle_call(:state, _from, state) do
+    {:reply, state, state}
+  end
+
+
   # find the log entry
   # testing for this should include terminating based on sorting
   # - have a log entry in the test at the end that is out of order and see if it finds it
@@ -116,29 +138,23 @@ defmodule Skiff do
   # we've run out of old logs.
   def merge_logs(newlogs, []), do: newlogs
 
-  ########################
-  # AppendEntries
-  @doc """
-  """
-  def handle_call({:appendEntries, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}, _from, state) do
-    if term < state.currentTerm do
-      {:reply, false, state}
-    else
-      if find_log_entry(state.log, prevLogTerm, prevLogIndex) == nil do
-        {:reply, false, state}
-      else
-        merged = merge_logs(entries, state.log)
-        commitIndex = if leaderCommit > state.commitIndex do
-          min(leaderCommit, Enum.at(merged, 0).index)
-        else
-          state.commitIndex
-        end
-        {:reply, {state.currentTerm, true}, %{state | commitIndex: commitIndex, log: merged}}
+
+  def update_state_with_leader_commit({reply_type, reply, state}, leaderCommit) do
+    if leaderCommit > state.commitIndex do
+      case state.log do
+        [] ->
+          %{state | commitIndex: 0}
+        [%{:index => index} | _] when index > leaderCommit ->
+          %{state | commitIndex: leaderCommit}
+        [%{:index => index} | _] ->
+          %{state | commitIndex: index}
+        _ ->
+          raise "top of log doesn't contain an index key"
       end
+    else
+      state
     end
+    |> (&({reply_type, reply, &1})).()
   end
 
-  def handle_call(:state, _from, state) do
-    {:reply, state, state}
-  end
 end
