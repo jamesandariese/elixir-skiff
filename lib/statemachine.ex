@@ -43,6 +43,12 @@ defmodule ServerState do
     }
   end
 
+  # from here on, RPCs are valid and should be acted upon.
+
+  @doc """
+  We received a valid AppendEntriesRPC call.  Convert to follower since we must not be the leader
+  and append the entries.
+  """
   def handle_event({:call, from}, {:append_entries, append_entries_data}, _, state) do
     IO.inspect({"append_entries", append_entries_data})
     {:next_state, :follower, state, 
@@ -53,8 +59,11 @@ defmodule ServerState do
     }
   end
 
+  @doc """
+  Entering follower state.  Start the election timeout.  Since we're not a candidate, clear our vote.
+  """
   def handle_event(:enter, :follower, _, state) do
-    {:keep_state, state,
+    {:keep_state, %{state | voted_for: nil},
       [
         {:state_timeout, state.election_timeout, :election_timeout},
         {{:timeout, :tick}, 10000, :tick},
@@ -71,7 +80,12 @@ defmodule ServerState do
     }
   end
 
+  @doc """
+  Handle an election timeout as leader.  This shouldn't be possible because of state transition timeouts
+  but putting this here just in case something breaks in the future.
+  """
   def handle_event(:state_timeout, :election_timeout, :leader, state) do
+    IO.inspect("Election timeout while leader.  This is a bug.")
     {:keep_state, %{state | voted_for: nil}}
   end
 
@@ -85,22 +99,39 @@ defmodule ServerState do
     }
   end
 
+  @doc """
+  Perform async request votes RPC call to all other nodes.
+  Call this via `{:next_event, :internal, :request_votes}`
+  """
   def handle_event(:internal, :request_votes, :candidate, state) do
     IO.inspect("TODO: REQUEST VOTES")
     {:keep_state, state}
   end
 
+  @doc """
+  Ignore request to request votes.  We're not a candidate so no one can vote for us.
+  """
   def handle_event(:internal, :request_votes, _, state) do
     IO.inspect("received request votes instruction when not a candidate")
     {:keep_state, state}
   end
 
+  @doc """
+  We're a candidate.  Vote for ourselves.
+  """
   def handle_event(:enter, :candidate, _, state) do
-    {:keep_state, state,
+    {:keep_state, %{state | voted_for: state.id},
       [
         {:state_timeout, state.election_timeout, :election_timeout},
       ]
     }
+  end
+
+  @doc """
+  We're not a candidate and we're not a follower.  Clear our vote.
+  """
+  def handle_event(:enter, _, _, state) do
+    {:keep_state, %{state | voted_for: nil}}
   end
 
   def handle_event({:call, from}, {:request_vote, request_vote_data}, _, state) do
