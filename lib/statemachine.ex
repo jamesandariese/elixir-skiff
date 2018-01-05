@@ -2,13 +2,35 @@ defmodule ServerState do
   use GenStateMachine, callback_mode: [:handle_event_function,:state_enter]
 
   defmodule State do
-    defstruct id: 0, current_term: 0, voted_for: nil, log: [], commit_index: 0, last_applied: 0, next_index: %{}, matchIndex: %{}, election_timeout: 3000
+    defstruct id: 0, current_term: 0, voted_for: nil, log: [], commit_index: 0, last_applied: 0, next_index: %{}, match_index: %{}, election_timeout: 3000, election_timeout_slop: 1000, nodes: [], new_nodes: []
   end
   defmodule AppendEntriesData do
     defstruct term: 0, leader_id: nil, prev_log_index: 0, prev_log_term: 0, entries: [], leader_commit: 0
   end
   defmodule RequestVoteData do
     defstruct term: 0, candidate_id: nil, last_log_index: 0, last_log_term: 0
+  end
+
+  #########################
+  # index_and_term_gte_log
+
+  # test if an index, term pair are >= a log's last entry
+  # first, handle the easy cases
+  defp index_and_term_gte_log(_index, term, [%{:term => log_term} | _rest]) when term > log_term, do: true
+  defp index_and_term_gte_log(_index, term, [%{:term => log_term} | _rest]) when term < log_term, do: false
+  # at this point, the terms must be equal.  test by index now.  if the log is more up to date...
+  defp index_and_term_gte_log(index, _term, [%{:index => log_index} | _rest]) when index < log_index, do: false
+  # finally, we've verified the log isn't *more* up to date (including when there's no log at all)
+  defp index_and_term_gte_log(_index, _term, _), do: true
+
+  #########################
+  # random_election_timeout
+  @doc """
+  Generate a random election timeout time in ms averaging ~state.election_timeout.
+  This is anywhere between timeout-slop..timeout+slop
+  """
+  def random_election_timeout(state) do
+    :rand.uniform(state.election_timeout_slop * 2) + state.election_timeout - state.election_timeout_slop
   end
 
   def handle_event({:call, from}, {:append_entries, append_entries_data}, :leader, state) do
@@ -19,7 +41,7 @@ defmodule ServerState do
     end
   end
 
-
+  # {:ok, pid} = GenStateMachine.start_link(ServerState, nil)
   # GenStateMachine.call(pid, {:request_vote, %ServerState.RequestVoteData{term: 1, candidate_id: 2}})
 
   @doc """
@@ -54,7 +76,7 @@ defmodule ServerState do
     {:next_state, :follower, state, 
       [
         {:reply, from, {state.current_term, true}},
-        {:state_timeout, state.election_timeout, :election_timeout},
+        {:state_timeout, random_election_timeout(state), :election_timeout},
       ]
     }
   end
@@ -65,7 +87,7 @@ defmodule ServerState do
   def handle_event(:enter, :follower, _, state) do
     {:keep_state, %{state | voted_for: nil},
       [
-        {:state_timeout, state.election_timeout, :election_timeout},
+        {:state_timeout, random_election_timeout(state), :election_timeout},
         {{:timeout, :tick}, 10000, :tick},
       ]
     }
@@ -93,7 +115,7 @@ defmodule ServerState do
     IO.inspect({"election_timeout", cstate})
     {:next_state, :candidate, %{state | voted_for: state.id, current_term: state.current_term + 1},
       [
-        {:state_timeout, state.election_timeout, :election_timeout},
+        {:state_timeout, random_election_timeout(state), :election_timeout},
         {:next_event, :internal, :request_votes},
       ]
     }
@@ -122,9 +144,39 @@ defmodule ServerState do
   def handle_event(:enter, :candidate, _, state) do
     {:keep_state, %{state | voted_for: state.id},
       [
-        {:state_timeout, state.election_timeout, :election_timeout},
+        {:state_timeout, random_election_timeout(state), :election_timeout},
       ]
     }
+  end
+
+  @doc """
+  We're a leader.  Tell the world by sending out some logs!
+  """
+  def handle_event(:enter, :leader, _, state) do
+    {:keep_state, %{state | voted_for: nil},
+      [
+        {:state_timeout, 0, :heartbeat},
+      ]
+    }
+  end
+
+  @doc """
+  Send out new entries.  When the match_index and next_index entries are initialized, this will
+  send an empty AppendEntriesRPC.  These entries are intiailized when a leader is elected so
+  this handler can be used for all uses of AppendEntriesRPC.
+
+  Send immediately upon exit of another event via
+  
+      {:state_timeout, 0, :heartbeat}
+
+  This must only be done while node type is :leader.
+  """
+  def handle_event(_, :heartbeat, :leader, state) do
+    IO.inspect("TODO SEND HEARTBEAT")
+    {:keep_state, state,
+      [
+        {:state_timeout, max(state.election_timeout - (state.election_timeout_slop * 2), state.election_timeout/3), :heartbeat},
+      ]
   end
 
   @doc """
@@ -137,18 +189,13 @@ defmodule ServerState do
   def handle_event({:call, from}, {:request_vote, request_vote_data}, _, state) do
     IO.inspect({"request_vote", request_vote_data})
 
-    yesno = (
-    if state.current_term > request_vote_data.term do
-      false
+    with true <- (state.voted_for == nil or state.voted_for == request_vote_data.candidate_id),
+         true <- index_and_term_gte_log(request_vote_data.last_log_index, request_vote_data.last_log_term, state.log)
+    do
+      {:keep_state, state, {:reply, from, {state.current_term, true}}}
     else
-      if state.voted_for == nil and candidate_up_to_date(request_vote_data, state) do
-        true
-      else
-        false
-      end
+      _ -> {:keep_state, state, {:reply, from, {state.current_term, false}}}
     end
-    )
-    {:keep_state, state, {:reply, from, {state.current_term, yesno}}}
   end
 
   def handle_event(a, b, st, data) do
