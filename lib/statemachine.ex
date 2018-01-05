@@ -2,13 +2,16 @@ defmodule ServerState do
   use GenStateMachine, callback_mode: [:handle_event_function,:state_enter]
 
   defmodule State do
-    defstruct id: 0, current_term: 0, voted_for: nil, log: [], commit_index: 0, last_applied: 0, next_index: %{}, match_index: %{}, election_timeout: 3000, election_timeout_slop: 1000, nodes: [], new_nodes: []
+    defstruct id: 0, current_term: 0, voted_for: nil, log: [], commit_index: 0, last_applied: 0, next_index: %{}, match_index: %{}, election_timeout: 3000, election_timeout_slop: 1000, nodes: [], new_nodes: [], expected_nodes: 0, votes: 0
   end
   defmodule AppendEntriesData do
     defstruct term: 0, leader_id: nil, prev_log_index: 0, prev_log_term: 0, entries: [], leader_commit: 0
   end
   defmodule RequestVoteData do
     defstruct term: 0, candidate_id: nil, last_log_index: 0, last_log_term: 0
+  end
+  defmodule LogEntry do
+    defstruct index: 0, term: 0, value: nil
   end
 
   #########################
@@ -113,7 +116,7 @@ defmodule ServerState do
 
   def handle_event(:state_timeout, :election_timeout, cstate, state) do
     IO.inspect({"election_timeout", cstate})
-    {:next_state, :candidate, %{state | voted_for: state.id, current_term: state.current_term + 1},
+    {:next_state, :candidate, %{state | current_term: state.current_term + 1},
       [
         {:state_timeout, random_election_timeout(state), :election_timeout},
         {:next_event, :internal, :request_votes},
@@ -126,7 +129,31 @@ defmodule ServerState do
   Call this via `{:next_event, :internal, :request_votes}`
   """
   def handle_event(:internal, :request_votes, :candidate, state) do
-    IO.inspect("TODO: REQUEST VOTES")
+    {:keep_state, %{state | voted_for: state.id, votes: 1},
+      Enum.map(state.nodes, fn n -> {:next_event, :internal, {:request_vote_response, GenStateMachine.call(n, {:request_vote, generate_request_vote(state)})}} end)
+    }
+  end
+
+  def handle_event(:internal, {:request_vote_response, true}, :candidate, state) do
+    {:keep_state, %{state | votes: state.votes + 1},
+      [
+        {:next_event, :internal, :evaluate_votes},
+      ]
+    }
+  end
+
+  def handle_event(:internal, :evaluate_votes, :candidate, state) do
+    if (div(state.expected_votes, 2) + 1) <= state.votes do
+      {:next_state, :leader, state}
+    else
+      {:keep_state, state}
+    end
+  end
+
+  @doc """
+  Handle the late arrival of an evaluate_votes request.  just drop it.
+  """
+  def handle_event(:internal, :evaluate_votes, _, state) do
     {:keep_state, state}
   end
 
@@ -177,6 +204,7 @@ defmodule ServerState do
       [
         {:state_timeout, max(state.election_timeout - (state.election_timeout_slop * 2), state.election_timeout/3), :heartbeat},
       ]
+    }
   end
 
   @doc """
@@ -203,11 +231,30 @@ defmodule ServerState do
     {:keep_state, data}
   end
 
-  def init(args) do
-    {:ok, :follower, %State{}}
+  def handle_event({:call, from}, {:initialize_nodes, nodes}, _, state) do
+    {:keep_state, %{state | nodes: nodes},
+      [
+        {:reply, from, :Ok},
+      ]
+    }
   end
 
-  def candidate_up_to_date(rvd, state) do
-    true
+  def init(expected_nodes) do
+    {:ok, :follower, %State{expected_nodes: expected_nodes}}
   end
+
+
+  def generate_request_vote(state) do
+    {lli,llt} = case state.log do
+      [%{:index => index, :term, term} | _] -> {index, term}
+      [] -> {0,0}
+    end
+    %RequestVoteData{
+      term: state.current_term,
+      candidate_id: state.id,
+      last_log_index: lli,
+      last_log_term: llt,
+    }
+  end
+
 end
