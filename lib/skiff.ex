@@ -6,7 +6,7 @@ defmodule Skiff do
   use GenServer
 
   defmodule State do
-    defstruct currentTerm: 0, votedFor: nil, log: [], commitIndex: 0, lastApplied: 0, nextIndex: %{}, matchIndex: %{}
+    defstruct currentTerm: 0, votedFor: nil, log: [], commitIndex: 0, lastApplied: 0, nextIndex: %{}, matchIndex: %{}, serverType: :follower
   end
   
   defmodule LogEntry do
@@ -30,13 +30,21 @@ defmodule Skiff do
   # finally, we've verified the log isn't *more* up to date (including when there's no log at all)
   defp index_and_term_gte_log(_index, _term, _), do: true
 
+
+  @doc """
+  Wrapper for handle_call to allow cluster membership state machine update
+  """
+  def handle_call(arg, from, state) do
+    handle_call_aux(arg, from, state)
+  end
+
   ########################
   # RequestVote
 
   @doc """
     Reject a vote request when the candidate's term is less than our current term.
   """
-  def handle_call({:requestVote, term, _candidateId, _lastLogIndex, _lastLogTerm}, _from, state = %{:currentTerm => ct}) when term < ct do
+  def handle_call_aux({:requestVote, term, _candidateId, _lastLogIndex, _lastLogTerm}, _from, state = %{:currentTerm => ct}) when term < ct do
     {:reply, {state.currentTerm, false}, state}
   end
 
@@ -44,7 +52,7 @@ defmodule Skiff do
     ...or accept a vote request when we've note voted yet or voted for this candidate and that candidate's log is at least as up to date as ours
     if we've gotten an update to our log since this candidate started their campaign tour, we will withdraw our vote
     """
-    def handle_call({:requestVote, _term, candidateId, lastLogIndex, lastLogTerm}, _from, state = %{:votedFor => vf}) when vf == nil or vf == candidateId do
+    def handle_call_aux({:requestVote, _term, candidateId, lastLogIndex, lastLogTerm}, _from, state = %{:votedFor => vf}) when vf == nil or vf == candidateId do
     # doing this `if` here instead of inside the guard only works because the fallthrough is what comes next.  if another test were to come after this,
     # it would break because the `if` here would short circuit any future tests.  this bit of messiness is because I don't know elixir yet.  sorry.
     if index_and_term_gte_log(lastLogIndex, lastLogTerm, state.log) do
@@ -59,7 +67,7 @@ defmodule Skiff do
   @doc """
      ...otherwise, reject the vote request.
   """
-  def handle_call({:requestVote, _term, _candidateId, _lastLogIndex, _lastLogTerm}, _from, state) do
+  def handle_call_aux({:requestVote, _term, _candidateId, _lastLogIndex, _lastLogTerm}, _from, state) do
     {:reply, {state.currentTerm, false}, state}
   end
 
@@ -67,7 +75,7 @@ defmodule Skiff do
   # AppendEntries
   @doc """
   """
-  def handle_call({:appendEntries, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}, _from, state) do
+  def handle_call_aux({:appendEntries, term, leaderId, prevLogIndex, prevLogTerm, entries, leaderCommit}, _from, state) do
     if term < state.currentTerm do
       {:reply, {state.currentTerm, false}, state}
     else
@@ -80,7 +88,7 @@ defmodule Skiff do
     |> update_state_with_leader_commit(leaderCommit)
   end
 
-  def handle_call(:state, _from, state) do
+  def handle_call_aux(:state, _from, state) do
     {:reply, state, state}
   end
 
@@ -138,6 +146,18 @@ defmodule Skiff do
   # we've run out of old logs.
   def merge_logs(newlogs, []), do: newlogs
 
+  def apply_log(log, index) do
+    IO.inspect(log, index)
+  end
+
+  def apply_logs({reply_type, reply, state}) do
+    if state.commitIndex > state.lastApplied do
+      apply_log(state.log, state.lastApplied + 1)
+      {reply_type, reply, apply_logs({reply_type, reply, %{state | lastApplied: (state.lastApplied + 1)}})}
+    else
+      {reply_type, reply, state}
+    end
+  end
 
   def update_state_with_leader_commit({reply_type, reply, state}, leaderCommit) do
     if leaderCommit > state.commitIndex do
@@ -157,4 +177,7 @@ defmodule Skiff do
     |> (&({reply_type, reply, &1})).()
   end
 
+  def handle_info(:election_timeout, state) do
+
+  end
 end
