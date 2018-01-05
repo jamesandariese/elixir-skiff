@@ -15,8 +15,21 @@ defmodule ServerState do
     if append_entries_data.term > state.current_term do
       {:next_state, :follower, %{state | current_term: append_entries_data.term}, [:postpone]}
     else
-      {:keep_state, state, {:reply, from, false}}
+      {:keep_state, state, {:reply, from, {state.current_term, false}}}
     end
+  end
+
+
+  # GenStateMachine.call(pid, {:request_vote, %ServerState.RequestVoteData{term: 1, candidate_id: 2}})
+
+  @doc """
+  if the term in the RPC is lower than our current term, reject the RPC
+  """
+  def handle_event({:call, from}, event = {_, %{:term => rpc_term}}, _, state = %{:current_term => current_term}) when rpc_term < current_term do
+    IO.inspect({"rejecting out of date term", current_term, rpc_term})
+    {
+      :keep_state, state, {:reply, from, {current_term, false}}
+    }
   end
 
   @doc """
@@ -32,9 +45,9 @@ defmodule ServerState do
 
   def handle_event({:call, from}, {:append_entries, append_entries_data}, _, state) do
     IO.inspect({"append_entries", append_entries_data})
-    {:keep_state, state, 
+    {:next_state, :follower, state, 
       [
-        {:reply, from, :ok},
+        {:reply, from, {state.current_term, true}},
         {:state_timeout, state.election_timeout, :election_timeout},
       ]
     }
@@ -44,7 +57,7 @@ defmodule ServerState do
     {:keep_state, state,
       [
         {:state_timeout, state.election_timeout, :election_timeout},
-        {{:timeout, :tick}, 1000, :tick},
+        {{:timeout, :tick}, 10000, :tick},
       ]
     }
   end
@@ -53,7 +66,7 @@ defmodule ServerState do
     IO.inspect({{:timeout, :tick}, :tick, state_name, state})
     {:keep_state, state,
       [
-        {{:timeout, :tick}, 1000, :tick},
+        {{:timeout, :tick}, 10000, :tick},
       ]
     }
   end
