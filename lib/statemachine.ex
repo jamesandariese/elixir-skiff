@@ -44,13 +44,18 @@ defmodule ServerState do
     end
   end
 
-  # {:ok, pid} = GenStateMachine.start_link(ServerState, nil)
-  # GenStateMachine.call(pid, {:request_vote, %ServerState.RequestVoteData{term: 1, candidate_id: 2}})
+  # {:ok, pid1} = GenStateMachine.start_link(ServerState, {1, 3})
+  # {:ok, pid2} = GenStateMachine.start_link(ServerState, {2, 3})
+  # {:ok, pid3} = GenStateMachine.start_link(ServerState, {3, 3})
+  # GenStateMachine.call(pid1, {:initialize_nodes, [pid2, pid3]})
+  # GenStateMachine.call(pid2, {:initialize_nodes, [pid1, pid3]})
+  # GenStateMachine.call(pid3, {:initialize_nodes, [pid2, pid1]})
+  # GenStateMachine.call(pid1, {:request_vote, %ServerState.RequestVoteData{term: 1, candidate_id: 2}})
 
   @doc """
   if the term in the RPC is lower than our current term, reject the RPC
   """
-  def handle_event({:call, from}, event = {_, %{:term => rpc_term}}, _, state = %{:current_term => current_term}) when rpc_term < current_term do
+  def handle_event({:call, from}, _event = {_, %{:term => rpc_term}}, _, state = %{:current_term => current_term}) when rpc_term < current_term do
     IO.inspect({"rejecting out of date term", current_term, rpc_term})
     {
       :keep_state, state, {:reply, from, {current_term, false}}
@@ -87,7 +92,7 @@ defmodule ServerState do
   @doc """
   Entering follower state.  Start the election timeout.  Since we're not a candidate, clear our vote.
   """
-  def handle_event(:enter, :follower, _, state) do
+  def handle_event(:enter, _, :follower, state) do
     {:keep_state, %{state | voted_for: nil},
       [
         {:state_timeout, random_election_timeout(state), :election_timeout},
@@ -134,16 +139,34 @@ defmodule ServerState do
     }
   end
 
-  def handle_event(:internal, {:request_vote_response, true}, :candidate, state) do
-    {:keep_state, %{state | votes: state.votes + 1},
-      [
-        {:next_event, :internal, :evaluate_votes},
-      ]
-    }
+  def handle_event(:internal, {:request_vote_response, {term, granted}}, :candidate, state) do
+    if term > state.current_term do
+      {:next_state, :follower, %{state | current_term: term}}
+    else
+      {:keep_state, %{state | votes: state.votes + (if granted do 1 else 0 end)},
+        [
+          {:next_event, :internal, :evaluate_votes},
+        ]
+      }
+    end
+  end
+
+  @doc """
+  Handle a vote response when already leader.  Ignore it.
+  """
+  def handle_event(:internal, {:request_vote_response, {term, granted}}, :leader, state) do
+    {:keep_state, state}
+  end
+
+  @doc """
+  Handle a vote response when a follower.  Ignore it.
+  """
+  def handle_event(:internal, {:request_vote_response, {term, granted}}, :follower, state) do
+    {:keep_state, state}
   end
 
   def handle_event(:internal, :evaluate_votes, :candidate, state) do
-    if (div(state.expected_votes, 2) + 1) <= state.votes do
+    if (div(state.expected_nodes, 2) + 1) <= state.votes do
       {:next_state, :leader, state}
     else
       {:keep_state, state}
@@ -168,7 +191,8 @@ defmodule ServerState do
   @doc """
   We're a candidate.  Vote for ourselves.
   """
-  def handle_event(:enter, :candidate, _, state) do
+  def handle_event(:enter, _, :candidate, state) do
+    IO.inspect({"running for office.", state.id})
     {:keep_state, %{state | voted_for: state.id},
       [
         {:state_timeout, random_election_timeout(state), :election_timeout},
@@ -179,12 +203,22 @@ defmodule ServerState do
   @doc """
   We're a leader.  Tell the world by sending out some logs!
   """
-  def handle_event(:enter, :leader, _, state) do
+  def handle_event(:enter, _, :leader, state) do
+    IO.inspect({"We're the leader now!", state.id})
     {:keep_state, %{state | voted_for: nil},
       [
         {:state_timeout, 0, :heartbeat},
       ]
     }
+  end
+
+  defp calculate_heartbeat_time(state) do
+    if :rand.uniform(5) == 5 do
+      IO.inspect({"giving up our leadership", state.id})
+      state.election_timeout * 2
+    else
+      max(state.election_timeout - (state.election_timeout_slop * 2), state.election_timeout/3)
+    end
   end
 
   @doc """
@@ -200,9 +234,17 @@ defmodule ServerState do
   """
   def handle_event(_, :heartbeat, :leader, state) do
     IO.inspect("TODO SEND HEARTBEAT")
+    heartbeat_responses = 
+    for node <- state.nodes,
+      node != self() do
+        GenStateMachine.call(node, {:append_entries, nil})
+    end
+
+
     {:keep_state, state,
       [
-        {:state_timeout, max(state.election_timeout - (state.election_timeout_slop * 2), state.election_timeout/3), :heartbeat},
+        {:state_timeout, calculate_heartbeat_time(state), :heartbeat},
+        {:next_event, :internal, {:handle_append_entry_responses, heartbeat_responses}},
       ]
     }
   end
@@ -226,11 +268,6 @@ defmodule ServerState do
     end
   end
 
-  def handle_event(a, b, st, data) do
-    IO.inspect({"Fallthrough event", a, b, st, data})
-    {:keep_state, data}
-  end
-
   def handle_event({:call, from}, {:initialize_nodes, nodes}, _, state) do
     {:keep_state, %{state | nodes: nodes},
       [
@@ -239,14 +276,20 @@ defmodule ServerState do
     }
   end
 
-  def init(expected_nodes) do
-    {:ok, :follower, %State{expected_nodes: expected_nodes}}
+  def handle_event(a, b, st, data) do
+    IO.inspect({"Fallthrough event", a, b, st, data})
+    {:keep_state, data}
+  end
+
+
+  def init({id, expected_nodes}) do
+    {:ok, :follower, %State{id: id, expected_nodes: expected_nodes}}
   end
 
 
   def generate_request_vote(state) do
     {lli,llt} = case state.log do
-      [%{:index => index, :term, term} | _] -> {index, term}
+      [%{:index => index, :term => term} | _] -> {index, term}
       [] -> {0,0}
     end
     %RequestVoteData{
